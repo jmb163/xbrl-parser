@@ -1,0 +1,12 @@
+Some xbrl parsers read from the instance document, this can be okay if you know ahead of time what items you'd like, however this is hard to know. When analyzing a financial report
+you may always look for cash, but there often is not a US GAAP item called cash in the instance document, instead there will be an item called us-gaap:CashCashEquivalentsAtCarryingValue or 
+us-gaap:CashShortTermInvestments which will probably break your parser if you're looking just at the item names, and secondly, even if you get the name correct, there will be two copies or more
+of this item, depending on how many different contexts it appears in, so do you grab the first one that you see or the last one?
+
+The xbrl instance document is accompanies by some linkbases which are hard to figure out, but if you take a hard look at them you'll find that there is actually some useful data there. The same 
+things accounting wise are almost always called something slightly different by every single company on their financial reports (see the cash example) however there are a couple constants. Almost 
+every company has a couple things constant on their reports, like Liabilities, or Current Liabilities, etc. (some companies don't like to include total liabilities but we can fix that) and the 
+organization of a report can be understood by knowing which things are the children of what item according to the calculation linkbase.
+
+So instead of creating a monolithic object where to parse current liabilities alone I'd have to read the xbrl filing manual and see what companies are allowed to call every single item that could 
+be listed on that subsection alone of the financial statements we'll just let the xbrl tell us.
