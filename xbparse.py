@@ -1,10 +1,11 @@
 #!/Users/Jon/anaconda3/bin/python3
-from xbrl import XBRLParser, GAAP, GAAPSerializer
 import sys
 import glob
 from bs4 import BeautifulSoup
 import re
 import json
+from urllib.request import urlopen
+import urllib.request
 import requests
 import pandas
 import os
@@ -14,8 +15,247 @@ from threading import Thread
 import time
 from multiprocessing import Process
 from datetime import date
+import datetime
+import random
 
 usg = re.compile("us-gaap:*")
+
+class DataGrabber():
+    '''
+    This is good so far but perhaps not complete. I don't know what effect restricted stock has,
+    the addition of the user-agent workaround should allow me to pull files when I need and avoid 403
+    '''
+
+    #some randomly generated user agents to be used at random when doing HTTP requests.
+    u_agents = ["Mozilla/5.0 (Windows; U; Windows NT 6.2) AppleWebKit/532.25.3 (KHTML, like Gecko) Version/5.0.3 Safari/532.25.3",
+                "Mozilla/5.0 (Macintosh; U; PPC Mac OS X 10_7_9 rv:3.0; en-US) AppleWebKit/534.32.7 (KHTML, like Gecko) Version/5.0.4 Safari/534.32.7",
+                "Opera/9.10 (X11; Linux x86_64; en-US) Presto/2.9.183 Version/10.00",
+                "Mozilla/5.0 (iPad; CPU OS 8_2_1 like Mac OS X; en-US) AppleWebKit/532.7.4 (KHTML, like Gecko) Version/3.0.5 Mobile/8B118 Safari/6532.7.4",
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 7_0_2 like Mac OS X; sl-SI) AppleWebKit/535.38.4 (KHTML, like Gecko) Version/3.0.5 Mobile/8B114 Safari/6535.38.4",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_5_0 rv:5.0; sl-SI) AppleWebKit/532.48.6 (KHTML, like Gecko) Version/4.0.4 Safari/532.48.6"
+                ]
+    def u_agent(self):
+        return random.choice(self.u_agents)
+
+    def _date_from_string(self, s):
+        ymd = s.split(sep='-')
+        ymd = [int(x) for x in ymd]
+        return datetime.date(ymd[0], ymd[1], ymd[2])
+
+    def __init__(self, ticker):
+        self._issuer_name = ""
+        self._cik_number = self._get_cik(ticker)
+        self._insider_filings = self._get_insiders()
+        self._get_insider_holdings()
+        #will add some functionality later for updating the database of a company instead of searching for everything
+        self._day = datetime.date.today()
+        self._cutoff = datetime.date(self._day.year - 5, self._day.month - 1, self._day.day) #cutoff date for grabbing reports
+        self._reports = self._get_reports() #collects the indexes of 10-k and 10-Q reports for a quarterly look a financials
+        # print(json.dumps(self._reports, indent=1))
+        with open("{}_holdings.json".format(ticker), 'w') as f:
+            f.write(json.dumps(self._insider_filings, indent=2))
+        self._print()
+
+    def _pick_after_cutoff(self, index_list, t):
+        def date_of(res):
+                p = self._date_from_string(res.parent.parent.find("td", {"class":False, 'href':False, 'nowrap':False}).text)
+                return p
+        good_links = []
+        sec_base = "https://www.sec.gov"
+        for ref in index_list:
+            # print(ref)
+            rdate = date_of(ref)
+            if(rdate > self._cutoff):
+                report = {
+                    'document':sec_base + ref['href'],
+                    'date':"{}-{}-{}".format(rdate.year, rdate.month, rdate.day),
+                    'type':t
+                }
+                good_links.append(report)
+        return good_links
+
+    def _get_reports(self):
+        '''
+        get the links for the 10-Q and 10-K reports all the way back to a given cutoff date
+        :return:
+        '''
+
+
+        qbase = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={}&type=10-Q&dateb=&owner=exclude&count=40&search_text=".format(self._cik_number)
+        kbase = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={}&type=10-K&dateb=&owner=exclude&count=40&search_text=".format(self._cik_number)
+        qreq = urlopen(urllib.request.Request(qbase, headers={"User-Agent": self.u_agent()}))
+        qsoup = BeautifulSoup(str(qreq.read(), encoding='utf-8'), 'lxml')
+
+        kreq = urlopen(urllib.request.Request(kbase, headers={"User-Agent": self.u_agent()}))
+        ksoup = BeautifulSoup(str(kreq.read(), encoding='utf-8'), 'lxml')
+
+        a_pattern = re.compile(r'/Archives/')
+        q_ind = qsoup.find_all("a", {"href":a_pattern})
+        k_ind = ksoup.find_all("a", {"href":a_pattern})
+
+        q_links = self._pick_after_cutoff(q_ind, '10-Q')
+        k_links = self._pick_after_cutoff(k_ind, '10-K')
+        reports = q_links + k_links
+        reports.sort(key=lambda x: x['date'], reverse=True)
+        return reports
+        #exclude older files
+
+
+    def _print(self):
+        print("CIK: {}".format(self._cik_number))
+        for filing in self._insider_filings:
+            print(filing)
+
+    def _get_cik(self, ticker):
+        '''
+        gets the cik number from the ticker!
+        :param ticker:
+        :return:
+        '''
+        searchurl = "http://www.sec.gov/cgi-bin/browse-edgar?" + "action=getcompany&"
+        full = searchurl + "CIK={}".format(ticker)
+        # with open("website.txt", mode='r') as f:
+        #     req = f.read()
+        # print(full)
+        req = urlopen(urllib.request.Request(full, headers={"User-Agent":self.u_agent()})) #do this to get around 403
+        soup = BeautifulSoup(str(req.read(), encoding='utf-8'), 'lxml')
+        span = soup.find("span", {"class":"companyName"})
+        self._issuer_name = span.text[0:-43]
+        cikurl = span.find("a")
+        # print(cikurl.text[0:9])
+        cik_num = cikurl.text[0:10]
+        return cik_num
+
+    def _get_insiders(self):
+        '''
+        gets a list of CIK numbers and hrefs linked to the large holders of company
+        :return:
+        '''
+        url = "https://www.sec.gov/cgi-bin/own-disp?" + "action=getissuer&" + "CIK={}".format(self._cik_number)
+        req = urlopen(urllib.request.Request(url, headers={"User-Agent":self.u_agent()}))
+        soup = BeautifulSoup(str(req.read(), encoding='utf-8'), 'lxml')
+        rows = soup.find_all("a", {'href':re.compile(r'getowner')})
+        issuer_cik = []
+        for row in rows:
+            i_cik = row['href'][-10:]
+            issuer_cik.append({"name":row.text,
+                               "url":"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={}&type=&dateb=&owner=only&count=40&search_text=".format(i_cik),
+                               "history":[]
+                               })
+        return issuer_cik
+
+    def _get_insider_holdings(self):
+        '''
+        Goes through the holders and gets their holding history.
+
+        A little slow, but should only need to be done once.
+        :return:
+        '''
+        for holder in self._insider_filings:
+            print("Fetching the history now!")
+            holder["history"] = self._get_history(holder['url'])
+            print("Got their history!")
+            print(json.dumps(holder["history"], indent=2))
+
+    def _get_history(self, url):
+        req = urlopen(urllib.request.Request(url, headers={"User-Agent": self.u_agent()}))
+        soup = BeautifulSoup(str(req.read(), encoding='utf-8'), 'lxml')
+        refs = soup.find_all("a", {'href': re.compile(r'/Archives/')})
+        na = "N/A"
+        history = []
+        # Going to separate more simply
+        rows = [row.parent.parent() for row in refs]
+        for row in rows:
+            f_index = "https://www.sec.gov" + row[2]['href']
+            f_type = row[0].text
+            if f_type in ['3', '4/A', '5']:
+                    continue
+            self._parse_filing_xml(f_index, history)
+        return history
+
+    def _parse_filing_xml(self, url, history):
+        def value(item):
+            if not item:
+                    return na
+            v = item.find("value")
+            if(v):
+                    return v.text
+            else:
+                    return na
+        def is_common_stock(txt):
+            reference = ['common', 'shares', 'stock', 'stocks', 'share']
+            check = txt.lower().split(sep=' ')
+            similarity = 0
+            for word in check:
+                    if word in reference:
+                            similarity += 1
+            if similarity:
+                    return True
+            else:
+                    return False
+
+        na = "N/A"
+        req = urlopen(urllib.request.Request(url, headers={"User-Agent": self.u_agent()}))
+        soup1 = BeautifulSoup(str(req.read(), encoding='utf-8'), 'lxml')
+        ref = soup1.find("a", text=re.compile(r'.xml'))
+        xml_doc = "https://www.sec.gov" + ref['href']
+
+        req = urlopen(urllib.request.Request(xml_doc, headers={"User-Agent": self.u_agent()}))
+        soup = BeautifulSoup(str(req.read(), encoding='utf-8'), 'lxml')
+        if(soup.find("issuername") == None):
+            return
+        if (soup.find("issuername").text != self._issuer_name):
+            return
+        #maybe don't use the note for now
+        print("---------{}---------".format(xml_doc))
+        title = soup.find("securitytitle")
+        title = value(title)
+        tr_code = soup.find("transactioncode").text
+        fdate = soup.find("periodofreport").text
+        tdate = soup.find("transactiondate")
+        tdate = value(tdate)
+        ad = soup.find("transactionacquireddisposedcode")
+        ad = value(ad)
+
+        dtable = soup.find("derivativetable")
+        ndtable = soup.find("nonderivativetable")
+
+        tshares = na
+        tpps = na
+        num_shares = soup.find("sharesownedfollowingtransaction")
+        if(dtable and ndtable):
+            tshares = dtable.find("underlyingsecurityshares")
+            tshares = value(tshares)
+            tpps = dtable.find("conversionorexerciseprice")
+            tpps = value(tpps)
+        elif (dtable):
+            tshares = dtable.find("underlyingsecurityshares")
+            tshares = value(tshares)
+            tpps = dtable.find("conversionorexerciseprice")
+            tpps = value(tpps)
+        elif(ndtable):
+            tshares = ndtable.find("transactionshares")
+            tshares = value(tshares)
+            tpps = ndtable.find("transactionpricepershare")
+            tpps = value(tpps)
+        else:
+            return
+
+        f4 = {
+            "transaction_code": tr_code,
+            "filing_date": fdate,
+            "transaction_date": tdate,
+            "title:": title,
+            "shares": tshares,
+            "price": tpps,
+            "A/D": ad,
+            "document":xml_doc,
+            "current_position":value(num_shares)
+            }
+        history.append(f4)
+
+
+
 
 class Financials():
     '''
@@ -52,6 +292,12 @@ class Financials():
         For cash, this would mean you only grab the item under cashandcashequivalents that matches cash, or if you
         don't care about specificity, or just don't care about whether short term investments are included in cash
         you could set your preference for a more general item
+    5. Still a couple things to work out, for instance, some reports contain negative numbers directly in the xbrl,
+        while negative numbers are indicated in other documents by the decimals attribute, I should just check at load
+        time whether or not the gaap fact in question has the attribute decimals
+
+        check whether or not all the share based information shows up in the parenthetical, it usually does, but the code
+        seems to break in the somewhat likely case that I didn't pull it from somewhere else
     '''
     def _check_folder(self, folder):
         self._directory = os.getcwd() + '/' + folder
@@ -136,7 +382,6 @@ class Financials():
         elif '(parenthetical)' in definition.lower():
             return 0
         else:
-            #check for multiples
             check_def = self._clean_definition(definition)
             check_def = check_def.split(sep=' ')
             num_matches = 0
@@ -188,6 +433,11 @@ class Financials():
                 self._equity_change_ref = best['item']
             elif key == 'parenthetical':
                 self._parenthetical_ref = best['item']
+        # print(self._balance_sheet_ref)
+        # print(self._cash_flow_ref)
+        # print(self._equity_change_ref)
+        # print(self._income_ref)
+        # print(self._parenthetical_ref)
         return
 
     def _statement_format(self, flat_list, statement):
@@ -260,6 +510,7 @@ class Financials():
         :param tags:
         :return:
         '''
+        print("Parsing the arc\n")
         def get_item_name(linktofrom):
             name = linktofrom
             name = name.split(sep='_')
@@ -278,7 +529,15 @@ class Financials():
             return eval('{}{}'.format(base, address))
         def brackets(s):
             return '[\'' + s + '\']'
-        calc_tags = tags.find_all('link:calculationarc')
+        # calc_tags = tags[0].find_all('calculationarc')
+        # print(tags)
+
+        calc_tags = []
+        calc_pattern = re.compile(r'calculationarc')
+        for result in tags:
+                subset = result.find_all(calc_pattern)
+                calc_tags += subset
+        # print(calc_tags)
         stuff = []
         for i in range(0, len(calc_tags)):
             fro = get_item_name(xfrom(calc_tags[i]))
@@ -290,7 +549,6 @@ class Financials():
         items = list(dict.fromkeys(stuff))
         # print(items)
         new = {}
-
         for item in items:
             new[item] = {'to':[], 'from':[]}
         # for item in items:
@@ -313,7 +571,10 @@ class Financials():
 
             'us-gaap:Liabilities'[to] should be ['us-gaap:LiabilitiesAndStockholdersEquity']
             '''
+
+            print("Missing the total Liabilities")
             self._missing_liabilities = True
+            print(json.dumps(new, indent=2))
             subs = copy.deepcopy(new["us-gaap:LiabilitiesAndStockholdersEquity"]['to'])
             new['us-gaap:Liabilities'] = {}
             new['us-gaap:Liabilities']['from'] = ["us-gaap:LiabilitiesAndStockholdersEquity"]
@@ -386,7 +647,8 @@ class Financials():
         '''
         def brackets(s):
             return '[\'' + s + '\']'
-        locs = shares_link.find_all('link:loc')
+        locs = shares_link[0].find_all('link:loc')
+        # print(len(locs))
         values = []
         for loc in locs:
             gaap_item = loc.attrs['xlink:href'].split(sep='#')[-1]
@@ -419,14 +681,33 @@ class Financials():
         top level items will have an items category, and a total value,
         :return:
         '''
-        balance_link = self._calculation_base[0].find('link:calculationlink', {'xlink:role':self._balance_sheet_ref})
-        cashflow_link = self._calculation_base[0].find('link:calculationlink', {'xlink:role':self._cash_flow_ref})
-        operation_link = self._calculation_base[0].find('link:calculationlink', {'xlink:role':self._income_ref})
-        shares_link = self._presentation_base[0].find('link:presentationlink', {'xlink:role':self._parenthetical_ref})
+
+        # print('Refs are: ')
+        # print(self._balance_sheet_ref)
+        # print(self._cash_flow_ref)
+        # print(self._income_ref)
+        # print(self._parenthetical_ref)
+
+        # for i in range(0, len(self._calculation_base)):
+        #     print(i)
+        #     print(self._calculation_base[i])
+
+        balance_link = self._calculation_base[0].find_all(attrs={'xlink:role':self._balance_sheet_ref})
+        cashflow_link = self._calculation_base[0].find_all(attrs={'xlink:role':self._cash_flow_ref})
+        operation_link = self._calculation_base[0].find_all(attrs={'xlink:role':self._income_ref})
+        shares_link = self._presentation_base[0].find_all(attrs={'xlink:role':self._parenthetical_ref})
         # balance_link = self._get_proper_link(self._calculation_base, 'link:calculationlink', self._balance_sheet_ref)
         # cashflow_link = self._get_proper_link(self._calculation_base, 'link:calculationlink', self._cash_flow_ref)
         # operation_link = self._get_proper_link(self._calculation_base, 'link:calculationlink', self._income_ref)
         # shares_link = self._get_proper_link(self._presentation_base, 'link:presentationlink', self._parenthetical_ref)
+
+        # print("Bases are:" )
+        # print(balance_link)
+        # print(cashflow_link)
+        # print(operation_link)
+        # print(self._parenthetical_ref)
+        # print(shares_link)
+
         self.report = {}
         self._parse_arc(balance_link, 'balancesheet')
         self._parse_arc(cashflow_link, 'cashflows')
@@ -562,12 +843,17 @@ class Financials():
     def _parse_contexts(self):
         '''
         Get the start date, end date, or instant of a context, will be used later on for the statements
+
+        The current way doesn't seem to work, find the latest start and end dates for each statement
+        The Documente Date will be more easily found in the schema, look there first, find the latest date.
         :return:
         '''
         statements = list(self._formats.keys())
 
-        self._report_date = self._instance[0].find('dei:documentperiodenddate').text
+        #self._report_date = self._instance[0].find('dei:documentperiodenddate').text
+        
 
+        print(statements)
         for statement in statements:
             self._contexts[statement] = dict.fromkeys(self._contexts[statement])
             for key in self._contexts[statement].keys():
@@ -631,12 +917,18 @@ class Financials():
             if not ret:
                 return get_item_slow(instance, name, context)
             else:
+                if 'decimals' in ret.attrs:
+                    if float(ret.text) < 0 and '-' not in ret.text:
+                        return '-' + ret.text
                 return ret.text
 
         def get_item_slow(instance, name, context):
             ret = instance[0].find(name.lower(), {'contextref':context})
             if not ret:
                 return None
+            if 'decimals' in ret.attrs:
+                if float(ret.text) < 0 and '-' not in ret.text:
+                    return '-' + ret.text
             return ret.text
 
         def load_value(base, address, value):
@@ -721,7 +1013,6 @@ class Financials():
 
         end = time.time()
         print("Threads took {}s".format(round(end-start, 2)))
-
         return
 
     def _set_default_contexts(self):
@@ -737,9 +1028,13 @@ class Financials():
             'operations':None
         }
         statements = list(self._formats.keys())
+
+
+
         for statement in statements:
             contexts = list(self._contexts[statement].keys())
             #now determine which context is the most recent
+            print(contexts)
             best = contexts[0]
             for context in contexts:
                 instant = self._contexts[statement][context]['instant']
@@ -834,7 +1129,7 @@ class Financials():
                 'cashflow': self._address_of('cashflows', 'us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect')
             },
             'operations': {
-                'gross':self._address_of('operations', 'us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments'),
+                'gross':self._address_of('operations', ['us-gaap:GrossProfit', 'us-gaap:OperatingIncomeLoss']),
                 'net':self._address_of('operations', 'us-gaap:NetIncomeLoss')
             },
             'parenthetical': {
@@ -875,6 +1170,7 @@ class Financials():
             for g in gwords:
                 if s.lower() == g.lower():
                     num += 1
+        # print('Comparing: {}, {}'.format(swords, gwords))
         return num
 
     def _search_report(self, sub_list, search):
@@ -915,21 +1211,40 @@ class Financials():
         gwords = re.findall(camel, gitem)
         return gwords
 
-    def _address_of(self, statement, item):
+    def _address_of(self, statement, items):
+        def safe_index(list, value, default):
+            try:
+                return list.index(value)
+            except ValueError:
+                return default
         format_items = self._formats[statement]['flatlist']
-        items = [x[0] for x in format_items]
+        potential_items = [x[0] for x in format_items]
         # [print(x) for x in items]
-        if item in items:
-            ind = items.index(item)
-        else:
-            best = {'item':None, 'matches':0}
-            for i in items:
-                mach = self._num_matches(i, item)
-                if mach > best['matches']:
-                    # print(i, item)
-                    best['item'] = i
-                    best['matches'] = mach
-            ind = items.index(best['item'])
+        # print(statement)
+        # for f in potential_items:
+        #     print(f)
+        # print(len(potential_items))
+        # if len(potential_items) == 0:
+        #     print(json.dumps(self._formats, indent=2))
+        ind = 0
+        sitems = items
+        if type(items) != type([]):
+            sitems = [items]
+        for i in sitems:
+            if i in potential_items:
+                ind = potential_items.index(i)
+            else:
+                best = {'item': None, 'matches': 0}
+                # print(statement)
+                for d in potential_items:
+                    mach = self._num_matches(d, i)
+                    if mach > best['matches']:
+                        # print(i, item)
+                        best['item'] = d
+                        best['matches'] = mach
+                # ind = potential_items.index(best['item'])
+                ind = safe_index(potential_items, best['item'], None)
+
             #find the best item
 
         return format_items[ind][2]
@@ -977,15 +1292,15 @@ class Financials():
     def cash_from_investing(self, search_string='net cash provided by used in investing activities', context=None):
         return self.search(search_string, statement='cashflows', context=context, base=self.roots['cashflows']['investing'])
 
-    def cash_change(self, search_string='Cash CashEquivalents Restricted Cash And Restricted Cash Equivalents Period Increase Decrease Including Exchange Rate Effect',
+    def cash_change(self, search_string='cash cashcquivalents restricted cash and restricted cash equivalents period increase decrease including exchange rate effect',
                     context=None):
         return self.search(search_string, statement='cashflows', context=context, base=self.roots['cashflows']['cashflow'])
 
-    def net_income(self, search_string='cash cashequivalents restricted cash and restricted cash equivalents period increase decrease including exchange rate effect',
+    def net_income(self, search_string='net income loss',
                    context=None):
         return self.search(search_string, statement='operations', context=context, base=self.roots['operations']['net'])
 
-    def gross_income(self, search_string='income loss from continuing operations before income taxes minority interest and income loss from equity method investments',
+    def gross_profit(self, search_string='gross profit margin',
                      context=None):
         return self.search(search_string, statement='operations', context=context, base=self.roots['operations']['gross'])
 
@@ -1032,6 +1347,8 @@ def g(x):
 
 
 if __name__ == "__main__":
+    fname = '20180405mon'
+    grabber = DataGrabber("TSLA")#try to get data for a relatively small company!
     pass
 
 
